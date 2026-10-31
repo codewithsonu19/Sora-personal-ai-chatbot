@@ -78,9 +78,9 @@ def _default_num_ctx() -> int:
     typical consumer GPU.
     """
     try:
-        return int(os.environ.get("JARVIS_NUM_CTX", "16384"))
+        return int(os.environ.get("JARVIS_NUM_CTX", "2048"))
     except ValueError:
-        return 16384
+        return 2048
 
 
 def _ollama_request_options(
