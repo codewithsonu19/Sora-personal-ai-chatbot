@@ -754,3 +754,13 @@
   background: var(--color-accent);
   text-decoration: none;
 }
+
+
+/* Composer: hide scrollbar for suggestion chips horizontal scroll */
+.no-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
