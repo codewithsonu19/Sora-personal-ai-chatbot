@@ -1,0 +1,13 @@
+{
+  "name": "sora-personal-ai-chatbot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Sora: Personal AI Chatbot on Personal Devices",
+  "scripts": {
+    "dev": "npm --prefix frontend run dev",
+    "build": "npm --prefix frontend run build",
+    "preview": "npm --prefix frontend run preview",
+    "ui": "npm --prefix frontend run dev",
+    "start": "uv run jarvis gui"
+  }
+}
