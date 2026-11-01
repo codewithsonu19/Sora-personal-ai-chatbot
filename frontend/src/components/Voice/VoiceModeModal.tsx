@@ -1,3 +1,17 @@
+/**
+ * VoiceModeModal — full-screen live voice conversation with Sora.
+ *
+ * Key fixes over the previous version:
+ *  - Uses a ref-based state machine so callbacks never close over stale
+ *    React state (the root cause of "no input / no output").
+ *  - Properly awaits SpeechSynthesis voice list before speaking
+ *    (voiceschanged is async — the old version always got an empty list).
+ *  - Web Speech API continuous recognition drives the turn — no MediaRecorder
+ *    upload latency in the recognition path.
+ *  - Silence detection restarted correctly after each AI response.
+ *  - Conversation history passed to every AI turn for contextual replies.
+ *  - max_tokens reduced to 150 for sub-second first-token latency at 1.5b.
+ */
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   X,
@@ -6,9 +20,7 @@ import {
   Volume2,
   VolumeX,
   Sparkles,
-  Heart,
   MessageSquare,
-  Headphones,
   Check,
 } from 'lucide-react';
 import { useAppStore, generateId } from '../../lib/store';
@@ -19,9 +31,52 @@ import {
   getBestVoice,
   configureUtteranceForGender,
 } from '../../lib/voice-profiles';
-import { transcribeAudio } from '../../lib/api';
 
-type VoiceState = 'idle' | 'listening' | 'thinking' | 'speaking';
+// ── Types ────────────────────────────────────────────────────────────────────
+
+type VoicePhase = 'idle' | 'listening' | 'thinking' | 'speaking';
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+function hasBrowserSpeech(): boolean {
+  return (
+    typeof window !== 'undefined' &&
+    ('SpeechRecognition' in window || 'webkitSpeechRecognition' in window)
+  );
+}
+
+function getSpeechRecognitionClass(): any {
+  if (typeof window === 'undefined') return null;
+  return (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition || null;
+}
+
+/** Returns voices, waiting up to 1 s for the browser to load them. */
+function loadVoices(): Promise<SpeechSynthesisVoice[]> {
+  return new Promise((resolve) => {
+    const v = window.speechSynthesis.getVoices();
+    if (v.length > 0) { resolve(v); return; }
+    const handler = () => {
+      resolve(window.speechSynthesis.getVoices());
+      window.speechSynthesis.removeEventListener('voiceschanged', handler);
+    };
+    window.speechSynthesis.addEventListener('voiceschanged', handler);
+    setTimeout(() => resolve(window.speechSynthesis.getVoices()), 1000);
+  });
+}
+
+/** Strip markdown formatting so it sounds natural when spoken. */
+function toSpeakable(text: string): string {
+  return text
+    .replace(/```[\s\S]*?```/g, 'code block')
+    .replace(/`[^`]+`/g, '')
+    .replace(/[*_#~>]/g, '')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/https?:\/\/\S+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// ── Component ────────────────────────────────────────────────────────────────
 
 export function VoiceModeModal() {
   const voiceModeOpen = useAppStore((s) => s.voiceModeOpen);
@@ -33,277 +88,329 @@ export function VoiceModeModal() {
   const selectedModel = useAppStore((s) => s.selectedModel);
   const addMessage = useAppStore((s) => s.addMessage);
 
-  const [voiceState, setVoiceState] = useState<VoiceState>('idle');
-  const [userTranscript, setUserTranscript] = useState('');
-  const [assistantTranscript, setAssistantTranscript] = useState('');
-  const [isMuted, setIsMuted] = useState(false);
+  // ── UI state (render only) ───────────────────────────────────────────
+  const [phase, setPhase] = useState<VoicePhase>('idle');
+  const [liveTranscript, setLiveTranscript] = useState('');
+  const [aiReply, setAiReply] = useState('');
   const [audioLevel, setAudioLevel] = useState(0);
+  const [isMuted, setIsMuted] = useState(false);
+  const [permissionDenied, setPermissionDenied] = useState(false);
+  const [noSpeechAPI, setNoSpeechAPI] = useState(false);
 
-  const recognitionRef = useRef<any>(null);
+  // ── Ref-based state (no stale closure issues) ────────────────────────
+  const phaseRef = useRef<VoicePhase>('idle');
+  const isMutedRef = useRef(false);
+  const openRef = useRef(false);
+  const genderRef = useRef<VoiceGender>(settings.voiceGender || 'female');
+  const modelRef = useRef(selectedModel || 'qwen2.5:1.5b');
+  const activeIdRef = useRef(activeId);
+  const convIdRef = useRef<string | null>(null);
+
+  // Keep refs in sync with props/state
+  useEffect(() => { genderRef.current = settings.voiceGender || 'female'; }, [settings.voiceGender]);
+  useEffect(() => { modelRef.current = selectedModel || 'qwen2.5:1.5b'; }, [selectedModel]);
+  useEffect(() => { activeIdRef.current = activeId; }, [activeId]);
+  useEffect(() => { isMutedRef.current = isMuted; }, [isMuted]);
+  useEffect(() => { openRef.current = voiceModeOpen; }, [voiceModeOpen]);
+
+  // ── Audio / recognition refs ─────────────────────────────────────────
+  const recRef = useRef<any>(null);
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const currentUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
-  const audioContextRef = useRef<AudioContext | null>(null);
+  const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
-  const animFrameRef = useRef<number | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const animFrameRef = useRef<number | null>(null);
+  const liveTextRef = useRef('');
 
-  const currentGender = settings.voiceGender || 'female';
+  // ── setPhase wrapper that updates ref too ────────────────────────────
+  const updatePhase = useCallback((p: VoicePhase) => {
+    phaseRef.current = p;
+    setPhase(p);
+  }, []);
 
-  // Cleanup speech synthesis and timers
+  // ── Stop speech synthesis ────────────────────────────────────────────
   const stopSpeaking = useCallback(() => {
-    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-      window.speechSynthesis.cancel();
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+    utteranceRef.current = null;
+  }, []);
+
+  // ── Speak a reply aloud, then call onDone ────────────────────────────
+  const speakReply = useCallback(async (text: string, onDone: () => void) => {
+    stopSpeaking();
+    const speakable = toSpeakable(text);
+    if (!speakable || !('speechSynthesis' in window)) { onDone(); return; }
+
+    const utterance = new SpeechSynthesisUtterance(speakable);
+    utteranceRef.current = utterance;
+
+    try {
+      const voices = await loadVoices();
+      const gender = genderRef.current;
+      const best = getBestVoice(voices, gender);
+      configureUtteranceForGender(utterance, gender, best);
+    } catch {}
+
+    utterance.onstart = () => updatePhase('speaking');
+    utterance.onend = () => {
+      utteranceRef.current = null;
+      onDone();
+    };
+    utterance.onerror = () => {
+      utteranceRef.current = null;
+      onDone();
+    };
+
+    // Chrome bug: speech synthesis pauses when tab is background.
+    // Resume every 10 s to keep it going.
+    const keepAliveId = setInterval(() => {
+      if (window.speechSynthesis.paused) window.speechSynthesis.resume();
+    }, 10000);
+    utterance.onend = () => {
+      clearInterval(keepAliveId);
+      utteranceRef.current = null;
+      onDone();
+    };
+    utterance.onerror = () => {
+      clearInterval(keepAliveId);
+      utteranceRef.current = null;
+      onDone();
+    };
+
+    updatePhase('speaking');
+    window.speechSynthesis.speak(utterance);
+  }, [stopSpeaking, updatePhase]);
+
+  // ── Process one user turn through the AI ────────────────────────────
+  const processUserTurn = useCallback(async (text: string) => {
+    const trimmed = text.trim();
+    if (!trimmed) {
+      // Nothing heard — go back to listening
+      startListening(); // eslint-disable-line
+      return;
     }
-    currentUtteranceRef.current = null;
-    if (voiceState === 'speaking') {
-      setVoiceState('idle');
+
+    updatePhase('thinking');
+    setLiveTranscript(trimmed);
+    setAiReply('');
+
+    // Ensure we have a conversation
+    let convId = convIdRef.current;
+    if (!convId) {
+      const aid = activeIdRef.current;
+      convId = aid || createConversation(modelRef.current);
+      convIdRef.current = convId;
     }
-  }, [voiceState]);
 
-  // Speak a text response in the chosen voice gender
-  const speakResponse = useCallback(
-    (text: string, onDone?: () => void) => {
-      if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
-        onDone?.();
-        return;
-      }
+    // Add user message to store
+    addMessage(convId, {
+      id: generateId(),
+      role: 'user',
+      content: trimmed,
+      timestamp: Date.now(),
+    });
 
-      window.speechSynthesis.cancel();
-
-      // Clean text of markdown, asterisks, citations for audio speaking
-      const speakableText = text
-        .replace(/[*_#`~>\[\]\(\)]/g, ' ')
-        .replace(/https?:\/\/\S+/g, '')
-        .replace(/\s+/g, ' ')
-        .trim();
-
-      if (!speakableText) {
-        onDone?.();
-        return;
-      }
-
-      const utterance = new SpeechSynthesisUtterance(speakableText);
-      currentUtteranceRef.current = utterance;
-
-      try {
-        const voices = window.speechSynthesis.getVoices();
-        const bestVoice = getBestVoice(voices, currentGender);
-        configureUtteranceForGender(utterance, currentGender, bestVoice);
-      } catch {}
-
-      utterance.onstart = () => {
-        setVoiceState('speaking');
-      };
-
-      utterance.onend = () => {
-        setVoiceState('idle');
-        currentUtteranceRef.current = null;
-        onDone?.();
-      };
-
-      utterance.onerror = () => {
-        setVoiceState('idle');
-        currentUtteranceRef.current = null;
-        onDone?.();
-      };
-
-      window.speechSynthesis.speak(utterance);
-    },
-    [currentGender]
-  );
-
-  // Send the transcribed speech to Sora and stream the spoken response
-  const processUserMessage = useCallback(
-    async (textToSend: string) => {
-      const trimmed = textToSend.trim();
-      if (!trimmed) {
-        setVoiceState('listening');
-        return;
-      }
-
-      setVoiceState('thinking');
-      setUserTranscript(trimmed);
-      setAssistantTranscript('');
-
-      let convId = activeId;
-      if (!convId) {
-        convId = createConversation(selectedModel);
-      }
-
-      // Add user message to active conversation
-      const userMsg = {
-        id: generateId(),
-        role: 'user' as const,
-        content: trimmed,
-        timestamp: Date.now(),
-      };
-      addMessage(convId, userMsg);
-
-      // System companion prompt for emotional intelligence & warm conversation
-      const systemPrompt = {
+    // Build messages with history for context
+    const currentMsgs = useAppStore.getState().messages;
+    const apiMessages = [
+      {
         role: 'system' as const,
         content:
-          'You are Sora in Live Voice Mode. You are talking directly with the user. Listen with genuine empathy, validate their feelings and experiences, and reply conversationally and warmly like a close friend. Keep your responses natural, engaging, and relatively concise (1 to 3 sentences) so the conversation flows naturally.',
-      };
+          'You are Sora in Live Voice Mode. You are having a natural, flowing conversation with the user. Respond warmly and conversationally — like a thoughtful, empathetic friend. Keep responses concise (1-3 sentences) so the conversation feels natural and real-time. Always respond to what was actually said.',
+      },
+      ...currentMsgs.slice(-10).map((m) => ({ role: m.role, content: m.content })),
+    ];
 
-      const currentMsgs = useAppStore.getState().messages;
-      const apiMessages = [
-        systemPrompt,
-        ...currentMsgs.map((m) => ({ role: m.role, content: m.content })),
-      ];
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+    let accumulated = '';
 
-      const controller = new AbortController();
-      abortControllerRef.current = controller;
-      let accumulated = '';
-
-      try {
-        for await (const sse of streamChat(
-          {
-            model: selectedModel || 'qwen2.5:1.5b',
-            messages: apiMessages,
-            stream: true,
-            temperature: 0.85,
-            max_tokens: 512,
-          },
-          controller.signal
-        )) {
-          if (!sse.data) continue;
-          try {
-            const data = JSON.parse(sse.data);
-            const delta = data.choices?.[0]?.delta?.content;
-            if (delta) {
-              accumulated += delta;
-              setAssistantTranscript(accumulated);
-            }
-          } catch {}
-        }
-
-        // Add assistant message to conversation
-        if (accumulated.trim()) {
-          const assistantMsg = {
-            id: generateId(),
-            role: 'assistant' as const,
-            content: accumulated,
-            timestamp: Date.now(),
-          };
-          addMessage(convId, assistantMsg);
-
-          // Speak reply aloud!
-          speakResponse(accumulated, () => {
-            // Once spoken, automatically resume listening after a brief pause
-            if (voiceModeOpen && !isMuted) {
-              setTimeout(() => {
-                startListening();
-              }, 400);
-            }
-          });
-        } else {
-          setVoiceState('idle');
-        }
-      } catch (err) {
-        setVoiceState('idle');
+    try {
+      for await (const sse of streamChat(
+        {
+          model: modelRef.current,
+          messages: apiMessages,
+          stream: true,
+          temperature: 0.75,
+          max_tokens: 150, // short for fast voice responses
+        },
+        controller.signal,
+      )) {
+        if (!sse.data) continue;
+        try {
+          const data = JSON.parse(sse.data);
+          const delta = data.choices?.[0]?.delta?.content;
+          if (delta) {
+            accumulated += delta;
+            setAiReply(accumulated);
+          }
+        } catch {}
       }
-    },
-    [activeId, createConversation, selectedModel, addMessage, speakResponse, voiceModeOpen, isMuted]
-  );
-
-  // Start listening to the microphone
-  const startListening = useCallback(async () => {
-    if (isMuted) return;
-    stopSpeaking();
-    setUserTranscript('');
-    setVoiceState('listening');
-
-    // 1. Setup Web Speech Recognition if available (instant live transcription)
-    if (
-      typeof window !== 'undefined' &&
-      ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window)
-    ) {
-      try {
-        if (recognitionRef.current) {
-          recognitionRef.current.abort();
-        }
-        const SpeechRec =
-          (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-        const rec = new SpeechRec();
-        rec.continuous = true;
-        rec.interimResults = true;
-        rec.lang = 'en-US';
-
-        rec.onresult = (e: any) => {
-          let interim = '';
-          for (let i = 0; i < e.results.length; i++) {
-            interim += e.results[i][0].transcript;
-          }
-          setUserTranscript(interim);
-
-          // Auto-turn: reset silence timer when user is speaking
-          if (silenceTimerRef.current) {
-            clearTimeout(silenceTimerRef.current);
-          }
-          silenceTimerRef.current = setTimeout(() => {
-            if (interim.trim()) {
-              rec.stop();
-              processUserMessage(interim);
-            }
-          }, 1500); // 1.5s pause signals end of turn
-        };
-
-        rec.onerror = () => {
-          // If error or silence, stay ready
-        };
-
-        rec.start();
-        recognitionRef.current = rec;
-      } catch {}
+    } catch (err: any) {
+      if (err?.name !== 'AbortError') {
+        updatePhase('idle');
+        return;
+      }
     }
 
-    // 2. Setup Audio Waveform Visualizer
-    if (navigator.mediaDevices?.getUserMedia) {
+    if (accumulated.trim()) {
+      // Save assistant message
+      addMessage(convId, {
+        id: generateId(),
+        role: 'assistant',
+        content: accumulated,
+        timestamp: Date.now(),
+      });
+
+      // Speak it, then resume listening
+      await speakReply(accumulated, () => {
+        if (openRef.current && !isMutedRef.current) {
+          setTimeout(() => startListening(), 300); // eslint-disable-line
+        } else {
+          updatePhase('idle');
+        }
+      });
+    } else {
+      updatePhase('idle');
+    }
+  }, [addMessage, createConversation, speakReply, updatePhase]);
+
+  // ── Start microphone + audio analyser + speech recognition ──────────
+  const startListening = useCallback(async () => {
+    if (isMutedRef.current || !openRef.current) return;
+    stopSpeaking();
+
+    updatePhase('listening');
+    setLiveTranscript('');
+    setAiReply('');
+    liveTextRef.current = '';
+
+    // Clear any stale silence timer
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+
+    // ── Speech Recognition ──────────────────────────────────────────
+    if (!hasBrowserSpeech()) {
+      setNoSpeechAPI(true);
+      updatePhase('idle');
+      return;
+    }
+
+    const SpeechRec = getSpeechRecognitionClass();
+    if (!SpeechRec) { setNoSpeechAPI(true); updatePhase('idle'); return; }
+
+    try {
+      // Stop any existing recognition
+      if (recRef.current) {
+        try { recRef.current.abort(); } catch {}
+        recRef.current = null;
+      }
+
+      const rec = new SpeechRec();
+      rec.continuous = true;
+      rec.interimResults = true;
+      rec.lang = 'en-US';
+      rec.maxAlternatives = 1;
+
+      rec.onresult = (e: any) => {
+        if (phaseRef.current !== 'listening') return;
+
+        let finalText = '';
+        let interimText = '';
+        for (let i = 0; i < e.results.length; i++) {
+          const t = e.results[i][0].transcript;
+          if (e.results[i].isFinal) finalText += t;
+          else interimText += t;
+        }
+        const best = (finalText || interimText).trim();
+        liveTextRef.current = best;
+        setLiveTranscript(best);
+
+        // Silence detection: send after 1.8 s of no new words
+        if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+        if (best) {
+          silenceTimerRef.current = setTimeout(() => {
+            if (phaseRef.current !== 'listening') return;
+            const captured = liveTextRef.current.trim();
+            if (!captured) return;
+            try { rec.abort(); } catch {}
+            recRef.current = null;
+            processUserTurn(captured);
+          }, 1800);
+        }
+      };
+
+      rec.onerror = (e: any) => {
+        if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+          setPermissionDenied(true);
+          updatePhase('idle');
+          return;
+        }
+        // no-speech / network errors: restart
+        if (openRef.current && !isMutedRef.current && phaseRef.current === 'listening') {
+          setTimeout(() => startListening(), 500);
+        }
+      };
+
+      rec.onend = () => {
+        recRef.current = null;
+        // If we're still supposed to be listening (e.g., no-speech timeout),
+        // restart recognition automatically.
+        if (openRef.current && !isMutedRef.current && phaseRef.current === 'listening') {
+          setTimeout(() => startListening(), 200);
+        }
+      };
+
+      rec.start();
+      recRef.current = rec;
+    } catch {
+      updatePhase('idle');
+      return;
+    }
+
+    // ── Audio level visualizer ──────────────────────────────────────
+    if (!streamRef.current && navigator.mediaDevices?.getUserMedia) {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         streamRef.current = stream;
 
-        const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
-        audioContextRef.current = audioCtx;
-        const analyser = audioCtx.createAnalyser();
+        const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+        const ctx = new AudioCtx();
+        audioCtxRef.current = ctx;
+        const analyser = ctx.createAnalyser();
         analyser.fftSize = 64;
         analyserRef.current = analyser;
 
-        const source = audioCtx.createMediaStreamSource(stream);
-        source.connect(analyser);
+        const src = ctx.createMediaStreamSource(stream);
+        src.connect(analyser);
 
-        const dataArray = new Uint8Array(analyser.frequencyBinCount);
-        const checkLevel = () => {
+        const data = new Uint8Array(analyser.frequencyBinCount);
+        const tick = () => {
           if (!analyserRef.current) return;
-          analyserRef.current.getByteFrequencyData(dataArray);
-          let sum = 0;
-          for (let i = 0; i < dataArray.length; i++) {
-            sum += dataArray[i];
-          }
-          const avg = sum / dataArray.length;
-          setAudioLevel(Math.min(1, avg / 128));
-          animFrameRef.current = requestAnimationFrame(checkLevel);
+          analyserRef.current.getByteFrequencyData(data);
+          const avg = data.reduce((a, b) => a + b, 0) / data.length;
+          setAudioLevel(Math.min(1, avg / 80));
+          animFrameRef.current = requestAnimationFrame(tick);
         };
-        checkLevel();
-      } catch {}
+        tick();
+      } catch {
+        // Mic access denied for visualizer — recognition still works via browser API
+      }
     }
-  }, [isMuted, stopSpeaking, processUserMessage]);
+  }, [stopSpeaking, updatePhase, processUserTurn]);
 
-  // Stop listening
+  // ── Stop listening ───────────────────────────────────────────────────
   const stopListening = useCallback(() => {
     if (silenceTimerRef.current) {
       clearTimeout(silenceTimerRef.current);
       silenceTimerRef.current = null;
     }
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch {}
-      recognitionRef.current = null;
+    if (recRef.current) {
+      try { recRef.current.abort(); } catch {}
+      recRef.current = null;
     }
     if (animFrameRef.current) {
       cancelAnimationFrame(animFrameRef.current);
@@ -313,79 +420,132 @@ export function VoiceModeModal() {
       streamRef.current.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
     }
-    if (audioContextRef.current) {
-      try {
-        audioContextRef.current.close();
-      } catch {}
-      audioContextRef.current = null;
+    if (audioCtxRef.current) {
+      try { audioCtxRef.current.close(); } catch {}
+      audioCtxRef.current = null;
     }
+    analyserRef.current = null;
+    setAudioLevel(0);
   }, []);
 
-  // When modal opens/closes
+  // ── Full teardown ────────────────────────────────────────────────────
+  const teardownAll = useCallback(() => {
+    stopListening();
+    stopSpeaking();
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    updatePhase('idle');
+    setLiveTranscript('');
+    setAiReply('');
+    liveTextRef.current = '';
+  }, [stopListening, stopSpeaking, updatePhase]);
+
+  // ── Open / close effect ──────────────────────────────────────────────
   useEffect(() => {
     if (voiceModeOpen) {
-      startListening();
+      setPermissionDenied(false);
+      setNoSpeechAPI(false);
+      // Small delay lets the modal animation settle before requesting mic
+      setTimeout(() => startListening(), 400);
     } else {
-      stopListening();
-      stopSpeaking();
+      teardownAll();
     }
+    return () => teardownAll();
+  }, [voiceModeOpen]); // eslint-disable-line react-hooks/exhaustive-deps
 
-    return () => {
+  // ── Mute toggle ──────────────────────────────────────────────────────
+  const handleMuteToggle = useCallback(() => {
+    const willMute = !isMutedRef.current;
+    setIsMuted(willMute);
+    isMutedRef.current = willMute;
+    if (willMute) {
       stopListening();
-      stopSpeaking();
-    };
-  }, [voiceModeOpen]);
+      updatePhase('idle');
+    } else {
+      setTimeout(() => startListening(), 100);
+    }
+  }, [stopListening, startListening, updatePhase]);
 
-  // When gender changes during active session, give immediate voice preview
-  const handleGenderChange = (gender: VoiceGender) => {
+  // ── Orb click: toggle listen/pause ──────────────────────────────────
+  const handleOrbClick = useCallback(() => {
+    if (phaseRef.current === 'speaking') {
+      stopSpeaking();
+      startListening();
+    } else if (phaseRef.current === 'listening') {
+      stopListening();
+      updatePhase('idle');
+    } else if (phaseRef.current === 'idle') {
+      startListening();
+    }
+  }, [stopSpeaking, stopListening, startListening, updatePhase]);
+
+  // ── Gender switch with preview ───────────────────────────────────────
+  const handleGenderChange = useCallback((gender: VoiceGender) => {
     setVoiceGender(gender);
+    genderRef.current = gender;
     stopSpeaking();
-    const previewText =
+    const preview =
       gender === 'female'
-        ? 'Hi there! I am Sora. You can share whatever is on your mind.'
-        : 'Hello. I am Sora. I am here to listen and help.';
-    speakResponse(previewText);
-  };
+        ? "Hi! I'm Sora. What's on your mind?"
+        : "Hello. I'm Sora. How can I help you?";
+    speakReply(preview, () => {
+      if (openRef.current && !isMutedRef.current) startListening();
+    });
+  }, [setVoiceGender, stopSpeaking, speakReply, startListening]);
 
   if (!voiceModeOpen) return null;
 
+  // ── Phase-specific colors ────────────────────────────────────────────
+  const orbGlow =
+    phase === 'listening'
+      ? 'from-emerald-500 via-teal-400 to-cyan-500'
+      : phase === 'thinking'
+      ? 'from-amber-500 via-orange-400 to-purple-600'
+      : phase === 'speaking'
+      ? 'from-rose-500 via-pink-400 to-indigo-500'
+      : 'opacity-0';
+
+  const orbCore =
+    phase === 'listening'
+      ? 'from-emerald-400 to-cyan-700 shadow-emerald-500/50'
+      : phase === 'thinking'
+      ? 'from-amber-400 to-purple-800 shadow-purple-500/50'
+      : phase === 'speaking'
+      ? 'from-rose-400 to-indigo-700 shadow-rose-500/50'
+      : 'bg-zinc-800 shadow-black';
+
+  const statusLabel =
+    phase === 'listening' ? 'Listening…'
+    : phase === 'thinking' ? 'Thinking…'
+    : phase === 'speaking' ? 'Speaking…'
+    : 'Voice Ready';
+
+  const statusDot =
+    phase === 'listening' ? 'bg-emerald-400 animate-ping'
+    : phase === 'thinking' ? 'bg-amber-400 animate-pulse'
+    : phase === 'speaking' ? 'bg-rose-400 animate-pulse'
+    : 'bg-zinc-500';
+
   return (
-    <div className="fixed inset-0 z-50 flex flex-col justify-between items-center p-6 sm:p-10 bg-gradient-to-b from-zinc-950 via-zinc-900 to-black text-white select-none backdrop-blur-2xl transition-all duration-300">
+    <div className="fixed inset-0 z-50 flex flex-col justify-between items-center p-6 sm:p-10 bg-gradient-to-b from-zinc-950 via-zinc-900 to-black text-white select-none backdrop-blur-2xl">
       {/* ── Top Bar ── */}
       <div className="w-full max-w-4xl flex items-center justify-between z-10">
+        {/* Status pill */}
         <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-white/10 backdrop-blur-md border border-white/15 text-xs font-medium">
-          <div
-            className={`w-2.5 h-2.5 rounded-full ${
-              voiceState === 'listening'
-                ? 'bg-emerald-400 animate-ping'
-                : voiceState === 'speaking'
-                ? 'bg-rose-400 animate-pulse'
-                : voiceState === 'thinking'
-                ? 'bg-amber-400 animate-pulse'
-                : 'bg-zinc-400'
-            }`}
-          />
-          <span className="capitalize tracking-wide">
-            {voiceState === 'listening'
-              ? 'Listening...'
-              : voiceState === 'thinking'
-              ? 'Thinking...'
-              : voiceState === 'speaking'
-              ? 'Speaking...'
-              : 'Voice Ready'}
-          </span>
+          <div className={`w-2.5 h-2.5 rounded-full ${statusDot}`} />
+          <span className="tracking-wide">{statusLabel}</span>
         </div>
 
-        {/* ── Voice Gender Switcher ── */}
+        {/* Gender switcher */}
         <div className="flex items-center bg-zinc-800/80 p-1 rounded-full border border-white/10 shadow-lg">
           {SORA_VOICE_OPTIONS.map((opt) => {
-            const isSelected = currentGender === opt.gender;
+            const sel = (settings.voiceGender || 'female') === opt.gender;
             return (
               <button
                 key={opt.gender}
                 onClick={() => handleGenderChange(opt.gender)}
                 className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold transition-all cursor-pointer ${
-                  isSelected
+                  sel
                     ? 'bg-rose-500 text-white shadow-md shadow-rose-500/30'
                     : 'text-zinc-400 hover:text-white'
                 }`}
@@ -393,120 +553,113 @@ export function VoiceModeModal() {
               >
                 <span>{opt.avatar}</span>
                 <span>{opt.gender === 'female' ? 'Female' : 'Male'}</span>
-                {isSelected && <Check size={12} />}
+                {sel && <Check size={12} />}
               </button>
             );
           })}
         </div>
 
-        {/* ── Close Button ── */}
+        {/* Close */}
         <button
-          onClick={() => {
-            stopListening();
-            stopSpeaking();
-            setVoiceModeOpen(false);
-          }}
+          onClick={() => setVoiceModeOpen(false)}
           className="p-2.5 rounded-full bg-white/10 hover:bg-white/20 transition-colors text-zinc-300 hover:text-white cursor-pointer"
-          title="Switch to Chat Mode"
+          title="Close Voice Mode"
+          aria-label="Close Voice Mode"
         >
           <X size={20} />
         </button>
       </div>
 
-      {/* ── Center: Interactive Animated Orb & Transcript ── */}
+      {/* ── Center: Orb + Transcripts ── */}
       <div className="flex-1 flex flex-col items-center justify-center w-full max-w-2xl text-center px-4 z-10">
-        {/* Animated Voice Orb (Copilot / ChatGPT style) */}
+
+        {/* Error states */}
+        {permissionDenied && (
+          <div className="mb-6 px-5 py-3 rounded-xl bg-red-500/20 border border-red-500/40 text-red-300 text-sm">
+            Microphone permission denied. Please allow mic access in your browser settings and refresh.
+          </div>
+        )}
+        {noSpeechAPI && (
+          <div className="mb-6 px-5 py-3 rounded-xl bg-amber-500/20 border border-amber-500/40 text-amber-200 text-sm">
+            Voice input requires Chrome or Edge. Please open Sora in Chrome for the best experience.
+          </div>
+        )}
+
+        {/* Animated orb */}
         <div
-          onClick={() => {
-            if (voiceState === 'speaking') {
-              stopSpeaking();
-              startListening();
-            } else if (voiceState === 'listening') {
-              stopListening();
-              setVoiceState('idle');
-            } else {
-              startListening();
-            }
-          }}
+          onClick={handleOrbClick}
           className="relative w-56 h-56 sm:w-64 sm:h-64 rounded-full flex items-center justify-center cursor-pointer transition-transform hover:scale-105 active:scale-95"
+          title={phase === 'listening' ? 'Tap to pause' : 'Tap to start listening'}
         >
-          {/* Outer glowing pulsing aura */}
+          {/* Glow aura */}
           <div
-            className={`absolute inset-0 rounded-full blur-3xl opacity-60 transition-all duration-700 ${
-              voiceState === 'listening'
-                ? 'bg-gradient-to-tr from-emerald-500 via-teal-400 to-cyan-500 scale-125'
-                : voiceState === 'thinking'
-                ? 'bg-gradient-to-tr from-amber-500 via-orange-500 to-purple-600 animate-spin scale-110'
-                : voiceState === 'speaking'
-                ? 'bg-gradient-to-tr from-rose-500 via-pink-500 to-indigo-500 scale-125'
-                : 'bg-zinc-700 scale-95'
-            }`}
+            className={`absolute inset-0 rounded-full blur-3xl opacity-60 transition-all duration-700 bg-gradient-to-tr ${orbGlow}`}
             style={{
               transform:
-                voiceState === 'listening'
-                  ? `scale(${1.1 + audioLevel * 0.4})`
-                  : undefined,
+                phase === 'listening'
+                  ? `scale(${1.15 + audioLevel * 0.35})`
+                  : phase === 'speaking'
+                  ? 'scale(1.2)'
+                  : 'scale(0.9)',
             }}
           />
 
-          {/* Core sphere with fluid gradient */}
+          {/* Core sphere */}
           <div
-            className={`w-44 h-44 sm:w-52 sm:h-52 rounded-full relative z-10 flex items-center justify-center shadow-2xl transition-all duration-500 ${
-              voiceState === 'listening'
-                ? 'bg-gradient-to-br from-emerald-400 to-cyan-700 shadow-emerald-500/50'
-                : voiceState === 'thinking'
-                ? 'bg-gradient-to-br from-amber-400 to-purple-800 shadow-purple-500/50'
-                : voiceState === 'speaking'
-                ? 'bg-gradient-to-br from-rose-400 to-indigo-700 shadow-rose-500/50'
-                : 'bg-zinc-800 shadow-black'
-            }`}
+            className={`w-44 h-44 sm:w-52 sm:h-52 rounded-full relative z-10 flex items-center justify-center shadow-2xl transition-all duration-500 bg-gradient-to-br ${orbCore}`}
             style={{
               transform:
-                voiceState === 'listening'
-                  ? `scale(${1 + audioLevel * 0.2})`
-                  : voiceState === 'speaking'
+                phase === 'listening'
+                  ? `scale(${1 + audioLevel * 0.18})`
+                  : phase === 'speaking'
                   ? 'scale(1.05)'
                   : 'scale(1)',
             }}
           >
-            {/* Center icon */}
             <div className="text-white drop-shadow-md">
-              {voiceState === 'speaking' ? (
+              {phase === 'speaking' ? (
                 <Volume2 size={44} className="animate-pulse" />
-              ) : voiceState === 'thinking' ? (
+              ) : phase === 'thinking' ? (
                 <Sparkles size={44} className="animate-spin" />
               ) : isMuted ? (
                 <MicOff size={44} className="text-zinc-400" />
               ) : (
-                <Mic size={44} className="animate-pulse" />
+                <Mic size={44} className={phase === 'listening' ? 'animate-pulse' : ''} />
               )}
             </div>
           </div>
         </div>
 
-        {/* Dynamic Live Subtitles / Text Feedback */}
-        <div className="mt-8 min-h-[5rem] flex flex-col items-center justify-center">
-          {voiceState === 'listening' && (
-            <p className="text-lg sm:text-xl font-medium text-emerald-300 transition-opacity">
-              {userTranscript || 'Listening... talk freely about how you feel'}
+        {/* Live transcripts */}
+        <div className="mt-8 min-h-[5rem] flex flex-col items-center justify-center gap-2 max-w-lg">
+          {phase === 'listening' && (
+            <p className="text-lg sm:text-xl font-medium text-emerald-300 transition-all">
+              {liveTranscript || 'Listening… speak freely'}
             </p>
           )}
-
-          {voiceState === 'thinking' && (
-            <p className="text-lg sm:text-xl font-medium text-amber-300 animate-pulse">
-              Sora is reflecting on what you said...
-            </p>
+          {phase === 'thinking' && (
+            <>
+              {liveTranscript && (
+                <p className="text-sm text-zinc-400 italic">"{liveTranscript}"</p>
+              )}
+              <p className="text-lg sm:text-xl font-medium text-amber-300 animate-pulse">
+                Sora is thinking…
+              </p>
+            </>
           )}
-
-          {voiceState === 'speaking' && (
-            <p className="text-base sm:text-lg text-zinc-200 line-clamp-3 leading-relaxed px-4">
-              "{assistantTranscript}"
-            </p>
+          {phase === 'speaking' && (
+            <>
+              {liveTranscript && (
+                <p className="text-sm text-zinc-500 italic">"{liveTranscript}"</p>
+              )}
+              <p className="text-base sm:text-lg text-zinc-200 leading-relaxed line-clamp-4">
+                {aiReply}
+              </p>
+            </>
           )}
-
-          {voiceState === 'idle' && (
+          {phase === 'idle' && !permissionDenied && !noSpeechAPI && (
             <p className="text-sm sm:text-base text-zinc-400">
-              Tap the orb or speak to start sharing with Sora
+              Tap the orb or say something to start
             </p>
           )}
         </div>
@@ -514,35 +667,24 @@ export function VoiceModeModal() {
 
       {/* ── Bottom Controls ── */}
       <div className="w-full max-w-md flex items-center justify-center gap-4 z-10 pb-4">
-        {/* Mute / Unmute */}
+        {/* Mute */}
         <button
-          onClick={() => {
-            if (isMuted) {
-              setIsMuted(false);
-              startListening();
-            } else {
-              setIsMuted(true);
-              stopListening();
-              setVoiceState('idle');
-            }
-          }}
+          onClick={handleMuteToggle}
           className={`p-4 rounded-full transition-all cursor-pointer shadow-lg ${
             isMuted
               ? 'bg-red-500/20 text-red-400 border border-red-500/40'
               : 'bg-white/10 hover:bg-white/20 text-white border border-white/10'
           }`}
           title={isMuted ? 'Unmute microphone' : 'Mute microphone'}
+          aria-label={isMuted ? 'Unmute' : 'Mute'}
         >
           {isMuted ? <MicOff size={22} /> : <Mic size={22} />}
         </button>
 
-        {/* Interrupt / Stop Speaking */}
-        {voiceState === 'speaking' && (
+        {/* Interrupt (visible while AI is speaking) */}
+        {phase === 'speaking' && (
           <button
-            onClick={() => {
-              stopSpeaking();
-              startListening();
-            }}
+            onClick={() => { stopSpeaking(); startListening(); }}
             className="px-5 py-3 rounded-full bg-rose-500 hover:bg-rose-600 text-white font-medium text-sm flex items-center gap-2 shadow-lg shadow-rose-500/30 transition-transform active:scale-95 cursor-pointer"
             title="Interrupt and speak now"
           >
@@ -551,15 +693,11 @@ export function VoiceModeModal() {
           </button>
         )}
 
-        {/* Switch to Chat mode */}
+        {/* Switch to Chat */}
         <button
-          onClick={() => {
-            stopListening();
-            stopSpeaking();
-            setVoiceModeOpen(false);
-          }}
+          onClick={() => setVoiceModeOpen(false)}
           className="px-5 py-3 rounded-full bg-white/10 hover:bg-white/20 text-zinc-200 hover:text-white font-medium text-sm flex items-center gap-2 border border-white/10 shadow-lg transition-all cursor-pointer"
-          title="Return to text chat view"
+          title="Return to text chat"
         >
           <MessageSquare size={18} />
           <span>Switch to Chat</span>

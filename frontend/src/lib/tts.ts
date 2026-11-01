@@ -170,13 +170,31 @@ export const useTtsStore = create<TtsStore>((set, get) => ({
       if (mine !== token) return;
       const utterance = new SpeechSynthesisUtterance(trimmed);
 
+      // Await voice list — browsers fire voiceschanged asynchronously.
+      // getVoices() returns [] until loaded; without waiting we get the
+      // lowest-quality default voice on first speak.
+      const getLoadedVoices = (): Promise<SpeechSynthesisVoice[]> =>
+        new Promise((res) => {
+          const v = window.speechSynthesis.getVoices();
+          if (v.length > 0) { res(v); return; }
+          const handler = () => {
+            res(window.speechSynthesis.getVoices());
+            window.speechSynthesis.removeEventListener('voiceschanged', handler);
+          };
+          window.speechSynthesis.addEventListener('voiceschanged', handler);
+          setTimeout(() => res([]), 1000); // fallback: speak with default voice
+        });
+
       // Select natural sounding voice matching selected gender (Male/Female)
       try {
         const gender: VoiceGender = useAppStore.getState().settings.voiceGender || 'female';
-        const voices = window.speechSynthesis.getVoices();
+        const voices = await getLoadedVoices();
+        if (mine !== token) return; // another speak() won the race
         const bestVoice = getBestVoice(voices, gender);
         configureUtteranceForGender(utterance, gender, bestVoice);
       } catch {}
+
+      if (mine !== token) return;
 
       utterance.onstart = () => {
         if (mine === token) set({ state: 'speaking', speakingId: id });
@@ -186,7 +204,7 @@ export const useTtsStore = create<TtsStore>((set, get) => ({
         teardown();
         set({ state: 'idle', speakingId: null });
       };
-      utterance.onerror = (e) => {
+      utterance.onerror = () => {
         if (mine !== token) return;
         teardown();
         set({ state: 'idle', speakingId: null, error: 'Voice playback interrupted', errorId: id });
