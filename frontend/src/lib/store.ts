@@ -108,6 +108,7 @@ interface Settings {
   speechEnabled: boolean;
   voiceOutputEnabled: boolean;
   voiceAutoplay: boolean;
+  voiceGender: 'female' | 'male';
 }
 
 function loadSettings(): Settings {
@@ -123,6 +124,7 @@ function loadSettings(): Settings {
     speechEnabled: true,
     voiceOutputEnabled: true,
     voiceAutoplay: false,
+    voiceGender: 'female',
   };
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
@@ -170,6 +172,11 @@ interface AppState {
 
   // Settings
   settings: Settings;
+
+  // Voice mode
+  voiceModeOpen: boolean;
+  setVoiceModeOpen: (open: boolean) => void;
+  setVoiceGender: (gender: 'female' | 'male') => void;
 
   // Command palette
   commandPaletteOpen: boolean;
@@ -294,6 +301,7 @@ export const useAppStore = create<AppState>((set, get) => {
 
     settings: loadSettings(),
 
+    voiceModeOpen: false,
     commandPaletteOpen: false,
     sidebarOpen: true,
     systemPanelOpen: true,
@@ -556,6 +564,13 @@ export const useAppStore = create<AppState>((set, get) => {
 
     // ── UI ──────────────────────────────────────────────────────────
 
+    setVoiceModeOpen: (open: boolean) => set({ voiceModeOpen: open }),
+    setVoiceGender: (gender: 'female' | 'male') => {
+      const current = get().settings;
+      const next = { ...current, voiceGender: gender };
+      saveSettings(next);
+      set({ settings: next });
+    },
     setCommandPaletteOpen: (open: boolean) => set({ commandPaletteOpen: open }),
     toggleSidebar: () => set((s) => ({ sidebarOpen: !s.sidebarOpen })),
     setSidebarOpen: (open: boolean) => set({ sidebarOpen: open }),

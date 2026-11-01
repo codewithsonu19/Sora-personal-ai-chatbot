@@ -6,7 +6,7 @@ import { StreamingDots } from './StreamingDots';
 import { useAppStore } from '../../lib/store';
 import { shouldAutoplayFinishedReply, useTtsStore } from '../../lib/tts';
 import { stripThinkTags } from '../../lib/message-text';
-import { Sparkles, PanelRightOpen, PanelRightClose, Database, MessageSquare, X } from 'lucide-react';
+import { Sparkles, PanelRightOpen, PanelRightClose, Database, MessageSquare, X, Headphones } from 'lucide-react';
 import { listConnectors } from '../../lib/connectors-api';
 
 function getGreeting(): string {
@@ -134,16 +134,28 @@ export function ChatArea() {
 
   return (
     <div className="flex flex-col h-full">
-      {/* Toggle bar */}
-      <div className="flex items-center justify-end px-3 py-1.5 shrink-0">
-        <button
-          onClick={toggleSystemPanel}
-          className="p-1.5 rounded-md transition-colors cursor-pointer"
-          style={{ color: 'var(--color-text-tertiary)' }}
-          title={`${systemPanelOpen ? 'Hide' : 'Show'} system panel (${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'}+I)`}
-        >
-          <PanelIcon size={16} />
-        </button>
+      {/* Action bar with Voice Mode */}
+      <div className="flex items-center justify-between px-4 py-1.5 shrink-0 border-b border-[var(--color-border)]">
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => useAppStore.getState().setVoiceModeOpen(true)}
+            className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium cursor-pointer transition-all bg-gradient-to-r from-rose-500/15 to-purple-500/15 border border-rose-500/30 text-rose-400 hover:text-rose-300 hover:border-rose-500/50 shadow-sm"
+            title="Start live interactive voice conversation (ChatGPT / Copilot style)"
+          >
+            <Headphones size={13} className="animate-pulse text-rose-400" />
+            <span>Voice Mode</span>
+          </button>
+        </div>
+        <div className="flex items-center gap-1">
+          <button
+            onClick={toggleSystemPanel}
+            className="p-1.5 rounded-md transition-colors cursor-pointer"
+            style={{ color: 'var(--color-text-tertiary)' }}
+            title={`${systemPanelOpen ? 'Hide' : 'Show'} system panel (${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'}+I)`}
+          >
+            <PanelIcon size={16} />
+          </button>
+        </div>
       </div>
 
       {/* Data sources banner */}

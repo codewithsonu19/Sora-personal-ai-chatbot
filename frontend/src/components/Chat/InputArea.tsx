@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { Send, Square, Paperclip, Search, Heart } from 'lucide-react';
+import { Send, Square, Paperclip, Search, Heart, Headphones } from 'lucide-react';
 import { toast } from 'sonner';
 import { useAppStore, generateId } from '../../lib/store';
 import { streamChat, streamResearch } from '../../lib/sse';
@@ -656,6 +656,14 @@ export function InputArea() {
               disabled={micDisabled}
               reason={micReason}
             />
+            <button
+              type="button"
+              onClick={() => useAppStore.getState().setVoiceModeOpen(true)}
+              className="p-2 rounded-xl transition-all shrink-0 cursor-pointer text-zinc-400 hover:text-rose-400 hover:bg-rose-500/10"
+              title="Open Live Voice Mode (interactive voice conversation)"
+            >
+              <Headphones size={16} />
+            </button>
             <button
               onClick={sendMessage}
               disabled={streamState.isStreaming || !input.trim() || modelLoading || !selectedModel}

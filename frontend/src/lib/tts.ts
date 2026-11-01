@@ -1,6 +1,8 @@
 import { create } from 'zustand';
 import { synthesizeSpeech, fetchTtsHealth } from './api';
 import { toSpeakableText } from './message-text';
+import { getBestVoice, configureUtteranceForGender, VoiceGender } from './voice-profiles';
+import { useAppStore } from './store';
 
 export type TtsState = 'idle' | 'loading' | 'speaking';
 
@@ -168,19 +170,13 @@ export const useTtsStore = create<TtsStore>((set, get) => ({
       if (mine !== token) return;
       const utterance = new SpeechSynthesisUtterance(trimmed);
 
-      // Select natural sounding voice if available
+      // Select natural sounding voice matching selected gender (Male/Female)
       try {
+        const gender: VoiceGender = useAppStore.getState().settings.voiceGender || 'female';
         const voices = window.speechSynthesis.getVoices();
-        const preferredVoice = voices.find((v) =>
-          (v.name.includes('Natural') || v.name.includes('Neural') || v.name.includes('Zira') || v.name.includes('Jenny') || v.name.includes('Google') || v.name.includes('Samantha') || v.name.includes('Aria')) &&
-          v.lang.startsWith('en')
-        ) || voices.find((v) => v.lang.startsWith('en'));
-
-        if (preferredVoice) utterance.voice = preferredVoice;
+        const bestVoice = getBestVoice(voices, gender);
+        configureUtteranceForGender(utterance, gender, bestVoice);
       } catch {}
-
-      utterance.rate = 1.0;
-      utterance.pitch = 1.0;
 
       utterance.onstart = () => {
         if (mine === token) set({ state: 'speaking', speakingId: id });

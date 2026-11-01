@@ -838,6 +838,32 @@ export function SettingsPage() {
                 />
               </button>
             </SettingRow>
+            <SettingRow label="Voice Gender" description="Choose between Female or Male voice for spoken replies and Voice Mode">
+              <div className="flex items-center gap-2 p-1 rounded-xl bg-[var(--color-bg-secondary)] border border-[var(--color-border)]">
+                <button
+                  type="button"
+                  onClick={() => { updateSettings({ voiceGender: 'female' }); showSaved(); }}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
+                    settings.voiceGender === 'female' || !settings.voiceGender
+                      ? 'bg-rose-500 text-white shadow-sm'
+                      : 'text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]'
+                  }`}
+                >
+                  👩 Female (Warm Sora)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { updateSettings({ voiceGender: 'male' }); showSaved(); }}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
+                    settings.voiceGender === 'male'
+                      ? 'bg-rose-500 text-white shadow-sm'
+                      : 'text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]'
+                  }`}
+                >
+                  👨 Male (Calm Sora)
+                </button>
+              </div>
+            </SettingRow>
             <SettingRow label="Voice" description="Backend and voice used for spoken replies">
               <div className="flex items-center gap-2">
                 <span
