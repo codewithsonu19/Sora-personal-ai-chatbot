@@ -24,7 +24,7 @@ export function SpeakMessageButton({ messageId, content }: Props) {
     <>
       <button
         onClick={() => (busy ? stop() : speak(messageId, content))}
-        className="p-1 rounded opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer"
+        className="p-1 rounded opacity-60 hover:opacity-100 transition-opacity cursor-pointer"
         style={{
           color: busy ? 'var(--color-accent)' : 'var(--color-text-tertiary)',
           opacity: busy ? 1 : undefined,

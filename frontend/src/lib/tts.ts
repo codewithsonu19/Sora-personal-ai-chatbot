@@ -53,6 +53,11 @@ export function shouldAutoplayFinishedReply(
 }
 
 function teardown(): void {
+  if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+    try {
+      window.speechSynthesis.cancel();
+    } catch {}
+  }
   if (audio) {
     // Detach first: clearing src re-runs the media load algorithm, which fails
     // on an empty source and dispatches an `error` event. With the handler
@@ -86,12 +91,22 @@ export const useTtsStore = create<TtsStore>((set, get) => ({
     if (healthProbe) return healthProbe;
     healthProbe = fetchTtsHealth()
       .then((health) => {
-        set({ available: health.available });
-        if (!health.available) healthProbe = null;
+        if (health.available) {
+          set({ available: true });
+        } else if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+          set({ available: true });
+        } else {
+          set({ available: false });
+          healthProbe = null;
+        }
       })
       .catch(() => {
-        set({ available: false });
-        healthProbe = null;
+        if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+          set({ available: true });
+        } else {
+          set({ available: false });
+          healthProbe = null;
+        }
       });
     return healthProbe;
   },
@@ -112,10 +127,16 @@ export const useTtsStore = create<TtsStore>((set, get) => ({
     const ac = new AbortController();
     controller = ac;
 
+    // Attempt backend speech synthesis first
+    let blob: Blob | null = null;
     try {
-      const blob = await synthesizeSpeech(trimmed, { signal: ac.signal });
-      if (mine !== token) return;
+      blob = await synthesizeSpeech(trimmed, { signal: ac.signal });
+    } catch {
+      // Backend TTS not configured or errored; will fallback to browser SpeechSynthesis
+    }
 
+    if (blob) {
+      if (mine !== token) return;
       const url = URL.createObjectURL(blob);
       objectUrl = url;
       const el = new Audio(url);
@@ -132,19 +153,72 @@ export const useTtsStore = create<TtsStore>((set, get) => ({
         set({ state: 'idle', speakingId: null, error: 'Playback failed', errorId: id });
       };
 
-      await el.play();
-      if (mine === token) set({ state: 'speaking', speakingId: id });
-    } catch (err) {
-      if (mine !== token) return;
-      if (err instanceof DOMException && err.name === 'AbortError') return;
-      teardown();
-      set({
-        state: 'idle',
-        speakingId: null,
-        error: err instanceof Error ? err.message : 'Speech synthesis failed',
-        errorId: id,
-      });
+      try {
+        await el.play();
+        if (mine === token) set({ state: 'speaking', speakingId: id });
+        return;
+      } catch (err) {
+        if (mine !== token) return;
+        // Audio play failed, fallback to browser speech below
+      }
     }
+
+    // High quality browser SpeechSynthesis fallback
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      if (mine !== token) return;
+      const utterance = new SpeechSynthesisUtterance(trimmed);
+
+      // Select natural sounding voice if available
+      try {
+        const voices = window.speechSynthesis.getVoices();
+        const preferredVoice = voices.find((v) =>
+          (v.name.includes('Natural') || v.name.includes('Neural') || v.name.includes('Zira') || v.name.includes('Jenny') || v.name.includes('Google') || v.name.includes('Samantha') || v.name.includes('Aria')) &&
+          v.lang.startsWith('en')
+        ) || voices.find((v) => v.lang.startsWith('en'));
+
+        if (preferredVoice) utterance.voice = preferredVoice;
+      } catch {}
+
+      utterance.rate = 1.0;
+      utterance.pitch = 1.0;
+
+      utterance.onstart = () => {
+        if (mine === token) set({ state: 'speaking', speakingId: id });
+      };
+      utterance.onend = () => {
+        if (mine !== token) return;
+        teardown();
+        set({ state: 'idle', speakingId: null });
+      };
+      utterance.onerror = (e) => {
+        if (mine !== token) return;
+        teardown();
+        set({ state: 'idle', speakingId: null, error: 'Voice playback interrupted', errorId: id });
+      };
+
+      try {
+        window.speechSynthesis.speak(utterance);
+        set({ state: 'speaking', speakingId: id });
+        return;
+      } catch (err) {
+        teardown();
+        set({
+          state: 'idle',
+          speakingId: null,
+          error: err instanceof Error ? err.message : 'Speech synthesis failed',
+          errorId: id,
+        });
+        return;
+      }
+    }
+
+    teardown();
+    set({
+      state: 'idle',
+      speakingId: null,
+      error: 'Speech synthesis is not available in this browser',
+      errorId: id,
+    });
   },
 
   stop: () => {

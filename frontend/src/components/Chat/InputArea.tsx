@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { Send, Square, Paperclip, Search } from 'lucide-react';
+import { Send, Square, Paperclip, Search, Heart } from 'lucide-react';
 import { toast } from 'sonner';
 import { useAppStore, generateId } from '../../lib/store';
 import { streamChat, streamResearch } from '../../lib/sse';
@@ -81,6 +81,7 @@ function useResearchCorpusSync(enabled: boolean): {
 
 export function InputArea() {
   const [input, setInput] = useState('');
+  const [companionMode, setCompanionMode] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -196,10 +197,18 @@ export function InputArea() {
 
     // Build API messages before adding assistant placeholder
     const currentMessages = useAppStore.getState().messages;
-    const apiMessages = currentMessages.map((m) => ({
-      role: m.role,
-      content: m.content,
-    }));
+    const apiMessages = [
+      ...(companionMode
+        ? [{
+            role: 'system',
+            content: 'You are Sora in Companion Mode (Heart-to-Heart). The user is talking directly to you, sharing their personal feelings, emotions, stress, or thoughts. Listen with deep empathy, warmth, validation, and genuine care. Speak as a trusted, comforting companion and friend. Validate their emotions first, offer thoughtful encouragement, and make them feel truly heard.',
+          }]
+        : []),
+      ...currentMessages.map((m) => ({
+        role: m.role,
+        content: m.content,
+      })),
+    ];
 
     const assistantMsg: ChatMessage = {
       id: generateId(),
@@ -376,7 +385,7 @@ export function InputArea() {
         }
       } else {
       for await (const sseEvent of streamChat(
-        { model: selectedModel, messages: apiMessages, stream: true, temperature, max_tokens: maxTokens },
+        { model: selectedModel, messages: apiMessages, stream: true, temperature: companionMode ? 0.85 : temperature, max_tokens: maxTokens },
         controller.signal,
       )) {
         const eventName = sseEvent.event;
@@ -581,6 +590,22 @@ export function InputArea() {
             <Search size={12} />
             Deep Research
           </button>
+          <button
+            type="button"
+            onClick={() => setCompanionMode(!companionMode)}
+            disabled={streamState.isStreaming}
+            aria-pressed={companionMode}
+            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs transition-colors cursor-pointer disabled:cursor-default disabled:opacity-50"
+            style={{
+              background: companionMode ? 'rgba(244, 63, 94, 0.15)' : 'transparent',
+              border: `1px solid ${companionMode ? '#f43f5e' : 'var(--color-border)'}`,
+              color: companionMode ? '#f43f5e' : 'var(--color-text-tertiary)',
+            }}
+            title={companionMode ? 'Companion Mode: On (Heart-to-Heart)' : 'Companion Mode: Off'}
+          >
+            <Heart size={12} fill={companionMode ? '#f43f5e' : 'none'} />
+            Companion Mode
+          </button>
         </div>
         {deepResearch && corpusSync.syncing && corpusSync.itemsSynced > 0 && (
           <div
@@ -608,7 +633,7 @@ export function InputArea() {
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder={selectedModel ? 'Message Sora...' : 'Pick a model first (⌘K)...'}
+          placeholder={companionMode ? 'Talk with Sora, share your feelings or thoughts...' : selectedModel ? 'Message Sora...' : 'Pick a model first (⌘K)...'}
           rows={1}
           className="flex-1 bg-transparent outline-none resize-none text-sm leading-relaxed"
           style={{ color: 'var(--color-text)', maxHeight: '200px' }}

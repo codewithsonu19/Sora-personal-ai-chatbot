@@ -120,14 +120,20 @@ function loadSettings(): Settings {
     defaultAgent: '',
     temperature: 0.7,
     maxTokens: 4096,
-    speechEnabled: false,
-    voiceOutputEnabled: false,
+    speechEnabled: true,
+    voiceOutputEnabled: true,
     voiceAutoplay: false,
   };
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
     if (!raw) return defaults;
-    return { ...defaults, ...JSON.parse(raw) };
+    const parsed = JSON.parse(raw);
+    return {
+      ...defaults,
+      ...parsed,
+      speechEnabled: parsed.speechEnabled !== undefined ? parsed.speechEnabled : true,
+      voiceOutputEnabled: parsed.voiceOutputEnabled !== undefined ? parsed.voiceOutputEnabled : true,
+    };
   } catch {
     return defaults;
   }
