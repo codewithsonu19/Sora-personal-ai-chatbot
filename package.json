@@ -4,10 +4,12 @@
   "private": true,
   "description": "Sora: Personal AI Chatbot on Personal Devices",
   "scripts": {
-    "dev": "npm --prefix frontend run dev",
+    "start": "uv run jarvis gui",
+    "dev": "uv run jarvis gui",
+    "gui": "uv run jarvis gui",
+    "backend": "uv run jarvis serve --port 8000",
+    "frontend": "npm --prefix frontend run dev",
     "build": "npm --prefix frontend run build",
-    "preview": "npm --prefix frontend run preview",
-    "ui": "npm --prefix frontend run dev",
-    "start": "uv run jarvis gui"
+    "preview": "npm --prefix frontend run preview"
   }
 }
